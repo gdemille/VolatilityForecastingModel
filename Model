@@ -1,0 +1,121 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.graphics.tsaplots as sgt
+from arch import arch_model
+from arch import __all__
+import statsmodels.tsa.stattools as sts
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller
+import statsmodels.api as sm
+from scipy.stats.distributions import chi2
+import seaborn as sns
+from pmdarima import auto_arima
+from arch.__future__ import reindexing
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tsa.api import VAR
+import datetime
+sns.set()
+
+#****************************************************************************
+#Inserting SPY & VIX
+#****************************************************************************
+tickers = ["SPY"]
+raw_data = yf.download(tickers, period="5y", interval="1d")
+df = pd.DataFrame(raw_data)
+df = df.rename(columns={'Adj Close': 'AdjClose'})
+df['market_value'] = df.AdjClose
+df['returns'] = df.market_value.pct_change(1).mul(100)
+del df['Open'], df['High'], df['Low'], df['AdjClose'], df['Volume'], df['Close']
+
+ticker_1 = ["^vix"]
+raw_data_1 = yf.download(ticker_1, period="5y", interval="1d")
+df1 = pd.DataFrame(raw_data_1)
+df1 = df1.rename(columns={'Adj Close': 'AdjClose'})
+df1['value'] = df1.AdjClose
+del df1['Open'], df1['High'], df1['Low'], df1['AdjClose'], df1['Volume'], df1['Close']
+
+#****************************************************************************
+#Separating training & testing data
+#****************************************************************************
+
+size1 = int(len(df1)*0.8)
+df1_train = df1.iloc[:size1]
+df1_test = df1.iloc[size1:]
+#Start & end for training the model
+start_date1 = df1_test.index[0]
+end_date1 = df1_test.index[-1]
+
+df1 = df1.iloc[2:]
+df1 = df1.asfreq('b')
+df1 = df1.fillna(method='ffill')
+
+size = int(len(df)*0.8)
+df_train = df.iloc[:size]
+df_test = df.iloc[size:]
+#Start & end for training the model
+start_date = df_test.index[0]
+end_date = df_test.index[-1]
+
+df = df.iloc[2:]
+df = df.asfreq('b')
+df = df.fillna(method='ffill')
+
+#****************************************************************************
+#SARIMAX using both endogenous & exogenous variables
+#****************************************************************************
+SARIMAX_df = df.join(df1)
+model = sm.tsa.statespace.SARIMAX(SARIMAX_df['returns'][1:], order=(8,1,1), exog=SARIMAX_df['value'][1:])
+results = model.fit(method='bfgs')
+print(results.summary())
+
+residuals = results.resid
+residuals_df = pd.DataFrame(data = residuals, columns = ['residuals'])
+residuals_df = residuals_df.dropna()
+residuals_df = abs(residuals_df)
+
+#****************************************************************************
+#Perform ARCH
+#****************************************************************************
+garch = arch_model(y = residuals_df['residuals'], mean='Constant', p = 1, q = 1, vol='GARCH',dist='studentst')
+garch_fitted = garch.fit(last_obs = start_date, update_freq=10)
+
+
+print(garch_fitted.summary())
+
+#****************************************************************************
+#Backtest
+#****************************************************************************
+Model_backtest = garch_fitted.forecast(horizon=1, align='target')
+Model_backtest.variance[start_date:end_date].plot(figsize=(20,5), color = 'red', zorder = 2)
+df.returns[start_date:end_date].abs().plot(color='blue', zorder = 1)
+plt.title("Volatility Backtest Predictions", size=24)
+plt.show
+
+backtest_pred_volatility = Model_backtest.variance[start_date:end_date].std().mean()*252**0.5
+backtest_actual_volatility = df.returns[start_date:end_date].std().mean()*252**0.5
+print("Predicted Volatility: ", backtest_pred_volatility)
+print("Actual Volatility: ", backtest_actual_volatility)
+
+#****************************************************************************
+#Forecasting & Plotting
+#****************************************************************************
+Model = garch_fitted.forecast(horizon=100, align='target')
+Model_df = Model.variance.transpose()
+model_df_plot = Model.variance.transpose()
+
+date = datetime.date.today()
+from_today = date.strftime('%Y-%m-%d')
+Volatility = Model_df.loc[from_today:].std(axis=0).mean()*252**0.5
+
+print("Expected Annual Volatility:", Volatility.round(2), "%")
+
+rolling_window = 2
+daily_volatility = model_df_plot.rolling(window=rolling_window).std().mean() * np.sqrt(252)
+plt.figure(figsize=(10,5))
+daily_volatility.plot(color='red')
+plt.title('Daily Annualized Volatility', fontsize=14)
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Volatility', fontsize=12)
+plt.show()
